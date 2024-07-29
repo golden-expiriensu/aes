@@ -1,14 +1,9 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+mod key;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+use key::Key;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+#[allow(unused_variables)]
+pub fn encode(data: &[u8], key: [u8; 32]) -> Vec<u8> {
+    let keys = Key::new(key).expand();
+    panic!("");
 }
