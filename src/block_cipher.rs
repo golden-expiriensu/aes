@@ -16,6 +16,20 @@ pub fn encrypt<'a, const L: usize>(block: Block, key: Key<L>) -> Vec<u8> {
         .into()
 }
 
+pub fn decrypt<'a, const L: usize>(block: Block, key: Key<L>) -> Vec<u8> {
+    let n_rounds = key.n_rounds();
+    let round_keys = key.expand();
+    // Since cipher is symmetric we just have to do inverse of that we did in encryption.
+    let mut block = inv_shift_rows(round_keys[n_rounds].xor(block)).map(sbox::inv_sub_byte);
+
+    for i in 1..n_rounds {
+        block = inv_shift_rows(inv_mix_columns(round_keys[n_rounds - i].xor(block)))
+            .map(sbox::inv_sub_byte);
+    }
+
+    round_keys[0].xor(block).into()
+}
+
 fn shift_rows(block: Block) -> Block {
     // Convert column major to row major matrix.
     let mut block = block.transposed();
@@ -26,32 +40,56 @@ fn shift_rows(block: Block) -> Block {
     block.transposed()
 }
 
+fn inv_shift_rows(block: Block) -> Block {
+    // Convert column major to row major matrix.
+    let mut block = block.transposed();
+    for (i, row) in block.rows_mut().enumerate() {
+        row.rotate_right(i);
+    }
+    // Convert back to column major matrix.
+    block.transposed()
+}
+
 fn mix_columns(block: Block) -> Block {
-    // Galois Field (256) multiplication of two bytes.
-    let mul_fn = |(mut a, mut b): (u8, u8)| -> u8 {
-        let mut p = 0;
-
-        for _ in 0..8 {
-            if (b & 1) != 0 {
-                p ^= a;
-            }
-
-            let hi_bit_set = (a & 0x80) != 0;
-            a <<= 1;
-            if hi_bit_set {
-                a ^= 0x1B; /* x^8 + x^4 + x^3 + x + 1 */
-            }
-            b >>= 1;
-        }
-
-        return p;
-    };
-
     block.mul(
         [[2, 1, 1, 3], [3, 2, 1, 1], [1, 3, 2, 1], [1, 1, 3, 2]].into(),
-        mul_fn,
+        gmul,
         BitXor::bitxor,
     )
+}
+
+fn inv_mix_columns(block: Block) -> Block {
+    block.mul(
+        [
+            [14, 9, 13, 11],
+            [11, 14, 9, 13],
+            [13, 11, 14, 9],
+            [9, 13, 11, 14],
+        ]
+        .into(),
+        gmul,
+        BitXor::bitxor,
+    )
+}
+
+// Galois Field (256) multiplication of two bytes.
+fn gmul((mut a, mut b): (u8, u8)) -> u8 {
+    let mut p = 0;
+
+    for _ in 0..8 {
+        if (b & 1) != 0 {
+            p ^= a;
+        }
+
+        let hi_bit_set = (a & 0x80) != 0;
+        a <<= 1;
+        if hi_bit_set {
+            a ^= 0x1B; /* x^8 + x^4 + x^3 + x + 1 */
+        }
+        b >>= 1;
+    }
+
+    return p;
 }
 
 #[cfg(test)]
@@ -74,6 +112,21 @@ mod tests {
     }
 
     #[test]
+    fn test_inv_shift_rows() {
+        let before = [
+            0x6e, 0x77, 0x5a, 0xc7, 0xd1, 0xbc, 0x77, 0x4d, 0x7d, 0x43, 0x51, 0x39, 0x26, 0xb6,
+            0x84, 0x4c,
+        ];
+        let after = inv_shift_rows(before.try_into().unwrap());
+
+        let expected = [
+            0x6e, 0xb6, 0x51, 0x4d, 0xd1, 0x77, 0x84, 0x39, 0x7d, 0xbc, 0x5a, 0x4c, 0x26, 0x43,
+            0x77, 0xc7,
+        ];
+        assert_eq!(Block::try_from(expected).unwrap(), after);
+    }
+
+    #[test]
     fn test_mix_columns() {
         let before = [
             0x6e, 0x77, 0x5a, 0xc7, 0xd1, 0xbc, 0x77, 0x4d, 0x7d, 0x43, 0x51, 0x39, 0x26, 0xb6,
@@ -84,6 +137,21 @@ mod tests {
         let expected = [
             0xd8, 0xa9, 0xff, 0x0a, 0x5c, 0x66, 0x54, 0x39, 0x57, 0x31, 0xd7, 0xe7, 0x45, 0x8a,
             0x57, 0xc0,
+        ];
+        assert_eq!(Block::try_from(expected).unwrap(), after);
+    }
+
+    #[test]
+    fn test_inv_mix_columns() {
+        let before = [
+            0xd8, 0xa9, 0xff, 0x0a, 0x5c, 0x66, 0x54, 0x39, 0x57, 0x31, 0xd7, 0xe7, 0x45, 0x8a,
+            0x57, 0xc0,
+        ];
+        let after = inv_mix_columns(before.try_into().unwrap());
+
+        let expected = [
+            0x6e, 0x77, 0x5a, 0xc7, 0xd1, 0xbc, 0x77, 0x4d, 0x7d, 0x43, 0x51, 0x39, 0x26, 0xb6,
+            0x84, 0x4c,
         ];
         assert_eq!(Block::try_from(expected).unwrap(), after);
     }
@@ -138,5 +206,63 @@ mod tests {
             0x38, 0x81,
         ];
         assert_eq!(encrypt(data.try_into().unwrap(), Key::new(key)), &expected);
+    }
+
+    #[test]
+    fn test_decrypt_128() {
+        let data = [
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44,
+            0x44, 0x44,
+        ];
+        let key = [
+            0x54, 0x68, 0x61, 0x74, 0x73, 0x20, 0x6d, 0x79, 0x20, 0x4b, 0x75, 0x6e, 0x67, 0x20,
+            0x46, 0x75,
+        ];
+        assert_eq!(
+            decrypt(
+                Block::try_from(encrypt(data.try_into().unwrap(), Key::new(key)).as_ref()).unwrap(),
+                Key::new(key),
+            ),
+            data
+        );
+    }
+
+    #[test]
+    fn test_decrypt_192() {
+        let data = [
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44,
+            0x44, 0x44,
+        ];
+        let key = [
+            0x54, 0x68, 0x61, 0x74, 0x73, 0x20, 0x6d, 0x79, 0x20, 0x4b, 0x75, 0x6e, 0x67, 0x20,
+            0x46, 0x75, 0x54, 0x68, 0x61, 0x74, 0x73, 0x20, 0x6d, 0x79,
+        ];
+        assert_eq!(
+            decrypt(
+                Block::try_from(encrypt(data.try_into().unwrap(), Key::new(key)).as_ref()).unwrap(),
+                Key::new(key),
+            ),
+            data
+        );
+    }
+
+    #[test]
+    fn test_decrypt_256() {
+        let data = [
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33, 0x44, 0x44,
+            0x44, 0x44,
+        ];
+        let key = [
+            0x54, 0x68, 0x61, 0x74, 0x73, 0x20, 0x6d, 0x79, 0x20, 0x4b, 0x75, 0x6e, 0x67, 0x20,
+            0x46, 0x75, 0x54, 0x68, 0x61, 0x74, 0x73, 0x20, 0x6d, 0x79, 0x20, 0x4b, 0x75, 0x6e,
+            0x67, 0x20, 0x46, 0x75,
+        ];
+        assert_eq!(
+            decrypt(
+                Block::try_from(encrypt(data.try_into().unwrap(), Key::new(key)).as_ref()).unwrap(),
+                Key::new(key),
+            ),
+            data
+        );
     }
 }
